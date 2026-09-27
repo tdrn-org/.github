@@ -1,0 +1,120 @@
+name: release-go-library
+
+# Wiederverwendbarer Release-Workflow für tdrn-org Go-Bibliotheken.
+#
+# Er taggt nur, wenn seit dem letzten Tag AUSSCHLIESSLICH Abhängigkeiten
+# geändert wurden: go.mod/go.sum vorhanden, keine .go-Datei, keine tdrn-org-Zeile
+# im Diff, kein Minor-Sprung der go-Zeile, nächste Patch-Version noch frei.
+# Der "grün"-Teil kommt vom Aufrufer (workflow_run auf einen erfolgreichen build).
+#
+# Aufruf aus einem Repo:
+#   uses: tdrn-org/.github/.github/workflows/release-go-library.yml@main
+#   with:
+#     sha: ${{ github.event.workflow_run.head_sha }}
+#     dry-run: true        # erst true, dann bewusst auf false stellen
+on:
+  workflow_call:
+    inputs:
+      sha:
+        description: 'Commit, das getaggt werden soll (Default: HEAD des aufrufenden Repos)'
+        required: false
+        type: string
+      dry-run:
+        description: 'true = nur prüfen und berichten, nichts taggen'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # Tag + Release (wirkt nur bei dry-run: false)
+    steps:
+      - name: Checkout (voller Verlauf, wegen Tags)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.sha || github.sha }}
+
+      - name: Gate prüfen
+        id: gate
+        env:
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -uo pipefail
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+          tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || echo "")
+          if [ -z "$tag" ]; then
+            echo "reason=kein Tag im Repo" >> "$GITHUB_OUTPUT"
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "letzter Tag: $tag"
+
+          files=$(git diff --name-only "$tag..HEAD")
+          [ -z "$files" ] && { echo "reason=nichts seit $tag" >> "$GITHUB_OUTPUT"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          code=$(printf '%s\n' "$files" | grep -c '\.go$')
+          dep=$(printf '%s\n' "$files" | grep -c '^go\.\(mod\|sum\)$')
+          intern=$(git diff "$tag..HEAD" -- go.mod | grep -c '^[+-].*tdrn-org/')
+
+          oldgo=$(git show "$tag:go.mod" 2>/dev/null | grep -m1 '^go ' | tr -d ' ' || echo "")
+          newgo=$(grep -m1 '^go ' go.mod | tr -d ' ' || echo "")
+          no="${oldgo#go}"; nn="${newgo#go}"
+          case "$no" in *.*.*) ;; *) no="$no.0" ;; esac
+          case "$nn" in *.*.*) ;; *) nn="$nn.0" ;; esac
+          if [ "$no" = "$nn" ]; then boden="ok"
+          elif [ "${no%.*}" = "${nn%.*}" ]; then boden="patch"
+          else boden="MINOR"; fi
+
+          echo "code=$code dep=$dep intern=$intern boden=$boden" 
+          echo "reason=code=$code dep=$dep intern=$intern boden=$boden" >> "$GITHUB_OUTPUT"
+
+          [ "$code" != "0" ]     && { echo "skip=true" >> "$GITHUB_OUTPUT"; echo "STOP: Code seit $tag geändert";     exit 0; }
+          [ "$intern" != "0" ]   && { echo "skip=true" >> "$GITHUB_OUTPUT"; echo "STOP: interne tdrn-org-Lib gehoben"; exit 0; }
+          [ "$boden" = "MINOR" ] && { echo "skip=true" >> "$GITHUB_OUTPUT"; echo "STOP: go-Zeile springt Minor";      exit 0; }
+          [ "$dep" = "0" ]       && { echo "skip=true" >> "$GITHUB_OUTPUT"; echo "nichts zu tun: nur Doku/Workflow"; exit 0; }
+
+          base="${tag#v}"; IFS=. read -r maj min pat <<< "$base"
+          next="v${maj}.${min}.$((pat + 1))"
+          if git rev-parse -q --verify "refs/tags/$next" >/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"; echo "Tag $next existiert bereits"; exit 0
+          fi
+
+          echo "next=$next"  >> "$GITHUB_OUTPUT"
+          echo "skip=false"  >> "$GITHUB_OUTPUT"
+          echo "Nächste Version wäre $next (dry-run=$DRY_RUN)"
+
+      - name: Release anlegen
+        if: steps.gate.outputs.skip == 'false' && inputs.dry-run == false
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          sha='${{ steps.gate.outputs.sha }}'
+          tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*')
+          next='${{ steps.gate.outputs.next }}'
+          {
+            echo "**Dependency updates only** — no source changes."
+            echo
+            echo '```diff'
+            git diff "$tag..HEAD" -- go.mod go.sum | grep '^[+-]' | grep -v '^[+-][+-][+-]' || true
+            echo '```'
+            echo
+            echo "Verified green by the \`build\` workflow on \`${sha:0:7}\`."
+          } > notes.md
+          gh release create "$next" --target "$sha" --title "$next" --notes-file notes.md
+
+      - name: Zusammenfassung
+        run: |
+          echo "### Release-Gate" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: \`${{ steps.gate.outputs.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Befund: ${{ steps.gate.outputs.reason }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Nächste Version: \`${{ steps.gate.outputs.next }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- getaggt: \`${{ steps.gate.outputs.skip == 'false' && inputs.dry-run == false }}\`" >> "$GITHUB_STEP_SUMMARY"
