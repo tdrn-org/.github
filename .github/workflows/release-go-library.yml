@@ -80,9 +80,14 @@ jobs:
           # "go 1.26" and "go 1.26.0" are the same requirement — normalise to three parts
           case "$old_ver" in *.*.*) ;; *) old_ver="$old_ver.0" ;; esac
           case "$new_ver" in *.*.*) ;; *) new_ver="$new_ver.0" ;; esac
+          # The gate stops a minor RAISE of the go directive (it pulls the whole fleet up),
+          # but a LOWERING of it is the goal — it widens the floor for consumers. Comparing
+          # the minor parts alone cannot tell the two apart, so check the direction.
           if [ "$old_ver" = "$new_ver" ]; then floor="ok"
           elif [ "${old_ver%.*}" = "${new_ver%.*}" ]; then floor="patch"   # same minor: harmless
-          else floor="MINOR"; fi                                          # pulls the fleet up
+          elif [ "$(printf '%s\n%s\n' "$old_ver" "$new_ver" | sort -V | head -1)" = "$new_ver" ]; then
+            floor="lowered"                                                # going down: intended
+          else floor="MINOR"; fi                                           # pulls the fleet up
 
           echo "code=$code dep=$dep internal=$internal floor=$floor"
           echo "reason=code=$code dep=$dep internal=$internal floor=$floor" >> "$GITHUB_OUTPUT"
